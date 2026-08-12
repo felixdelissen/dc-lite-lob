@@ -47,7 +47,6 @@ A simplified H-Net adapted to order book messages:
 |---|---|---|
 | `utf8_delim` | variable | UTF-8 text, pipe-separated, newline end-of-message |
 | `byte_aligned` | 22 bytes | little-endian fixed fields |
-| `bit_packed` | 21 bytes | as above, event type and direction share one byte |
 
 ## Data
 
@@ -81,11 +80,10 @@ numbers stay comparable across runs with different penalty weights.
 
 ## Results
 
-| Serialization | Val. bits/byte | Val. perplexity | Mean chunk length |
+| Serialization | Val. bits/byte | Val. perplexity | Coverage |
 |---|---|---|---|
-| `utf8_delim` | [X] | [X] | [X] |
-| `byte_aligned` | [X] | [X] | [X] |
-| `bit_packed` | [X] | [X] | [X] |
+| `utf8_delim` | 1.5155 | 2.859 | 70.0% |
+| `byte_aligned` | 1.7180 | 3.290 | 97.8% |
 
 Main finding: [one sentence].
 
