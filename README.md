@@ -99,7 +99,7 @@ pipeline.ipynb         end-to-end Colab walkthrough
 
 ## Limitations and next steps
 
-DC-Lite is pretrained on [scope] and evaluated on next-byte prediction. It is a
+DC-Lite is pretrained on a single NYSE instrument (Public Storage, PSA) over 252 trading days and evaluated on next-byte prediction. It is a
 pretraining backbone, not a foundation model: establishing that would require
 multi-instrument, multi-venue pretraining and evaluation on several unseen
 downstream tasks with frozen representations. That is the natural extension of
