@@ -1,19 +1,18 @@
-.ipynb_checkpoints/
+# Python
 __pycache__/
-*.pyc
-.DS_Store
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+
+# Training artifacts
 runs/
 *.pt
 *.ckpt
-*.h5
+
+# Data (LOBSTER files are licensed and must not be redistributed)
+data/
 *.bin
-*.onnx
-*.npz
-*.npy
-*.gdoc
-*.gsheet
-*.gslides
-*.gdraw
-*.gs
-*.lnk
-*.ipynb
+*.csv
+
+# OS
+.DS_Store
