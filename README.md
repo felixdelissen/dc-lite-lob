@@ -26,7 +26,7 @@ receive more capacity.
 
 A simplified H-Net adapted to order book messages:
 
-1. **Serialization** — LOBSTER rows to raw bytes under three schemes
+1. **Serialization** — LOBSTER rows to raw bytes under 2 schemes
    (`serialize_lobster.py`), so the effect of field layout on the learned
    segmentation can be measured.
 2. **Byte encoder** — embedding over a 256-symbol alphabet plus a shallow causal
