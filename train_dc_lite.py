@@ -1,380 +1,346 @@
-# -*- coding: utf-8 -*-
-# train_dc_lite.py  (Early Stopping + Resume + Periodic Checkpoints + Plots)
+"""Pretraining loop for DC-Lite on serialized LOBSTER byte streams.
 
-import os, sys, argparse, math, json, numpy as np, torch, torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
+Example:
+    python train_dc_lite.py \
+        --train-files data/train.bit_packed.bin \
+        --val-files data/val.bit_packed.bin \
+        --seq-len 1024 --batch-size 64 --epochs 24 --amp
 
-# --- make local imports work when run from anywhere ---
-FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-if FILE_DIR not in sys.path:
-    sys.path.insert(0, FILE_DIR)
+Cross-entropy is reported in nats per byte; perplexity and bits per byte are
+derived from it. The boundary-rate penalty is tracked separately so that the
+language-modelling numbers stay comparable across runs with different penalty
+weights.
+"""
 
-from dc_lite import DCLiteLM
+from __future__ import annotations
 
-# ---------------- dataset ----------------
+import argparse
+import json
+import math
+import os
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dc_lite import VOCAB_SIZE, DCLiteConfig, DCLiteLM  # noqa: E402
+
+
 class ByteSequenceDataset(Dataset):
-    def __init__(self, paths, seq_len=2048, step=None, bytes_cap=0):
-        blobs = []
-        for p in paths:
-            with open(p, "rb") as f:
-                blobs.append(f.read())
-        raw = b"".join(blobs)
-        if bytes_cap and bytes_cap > 0:
-            raw = raw[:bytes_cap]  # cap BEFORE building array
+    """Fixed-length windows over a concatenated stream of raw bytes.
 
-        arr = np.frombuffer(raw, dtype=np.uint8).astype(np.int64)
-        self.data = torch.from_numpy(arr)
-        self.seq_len = int(seq_len)
-        self.step = int(step) if step else self.seq_len
+    Args:
+        paths: files to concatenate, in order.
+        seq_len: window length in bytes.
+        stride: step between window starts; defaults to ``seq_len`` (no overlap).
+        bytes_cap: keep only the first N bytes of the stream (0 = keep all).
+    """
 
-        if len(self.data) < (self.seq_len + 1):
+    def __init__(
+        self,
+        paths: list[str],
+        seq_len: int = 2048,
+        stride: int | None = None,
+        bytes_cap: int = 0,
+    ) -> None:
+        raw = b"".join(Path(p).read_bytes() for p in paths)
+        if bytes_cap > 0:
+            raw = raw[:bytes_cap]
+        if len(raw) < seq_len + 1:
             raise ValueError(
-                f"Dataset too small for seq_len={self.seq_len}: {len(self.data)} bytes available."
+                f"stream has {len(raw)} bytes, need at least {seq_len + 1} for seq_len={seq_len}"
             )
+        self.data = torch.from_numpy(np.frombuffer(raw, dtype=np.uint8).astype(np.int64))
+        self.seq_len = seq_len
+        self.stride = stride or seq_len
+        self.starts = torch.arange(0, len(self.data) - seq_len - 1, self.stride)
 
-        # compute starts on final (possibly capped) length
-        self.starts = torch.arange(0, len(self.data) - self.seq_len - 1, self.step)
-
-    def __len__(self): 
+    def __len__(self) -> int:
         return self.starts.numel()
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         s = int(self.starts[idx])
-        x = self.data[s:s+self.seq_len].clone()
-        y = self.data[s+1:s+self.seq_len+1].clone()
-        return x, y
+        return (
+            self.data[s : s + self.seq_len].clone(),
+            self.data[s + 1 : s + self.seq_len + 1].clone(),
+        )
 
-def device_auto():
-    if torch.cuda.is_available(): return torch.device("cuda")
-    if hasattr(torch.backends,"mps") and torch.backends.mps.is_available(): return torch.device("mps")
+
+def pick_device() -> torch.device:
+    """Best available device: CUDA, then Apple MPS, then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
-def evaluate(model, loader, device, autocast_dtype=None,
-             collect_chunks=False, max_hist=0):
-    """
-    Returns: (avg_loss, ppl, bpb, chunk_len_samples)
-    If collect_chunks is True and the model supports return_chunks=True,
-    this gathers up to max_hist chunk-length samples from VAL.
+
+def autocast_dtype_for(device: torch.device, enabled: bool):
+    """Half-precision dtype to use for autocast, or None when disabled."""
+    if not enabled:
+        return None
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp_dtype=None,
+    collect_chunks: bool = False,
+    max_samples: int = 50_000,
+) -> dict:
+    """Validation pass.
+
+    Returns a dict with cross-entropy (nats/byte), perplexity, bits per byte,
+    the boundary-rate penalty, the mean chunk length, and optionally a sample of
+    chunk lengths for the histogram.
     """
     model.eval()
-    crit = nn.CrossEntropyLoss(reduction="sum")
-    tot, ntok = 0.0, 0
-    chunk_lens = []
-    with torch.no_grad():
-        for x,y in loader:
-            x=x.to(device); y=y.to(device)
-            if autocast_dtype:
-                with torch.autocast(device.type, dtype=autocast_dtype):
-                    logits, aux_loss, stats = model(
-                        x, return_aux=True, return_chunks=collect_chunks)
-                    loss = crit(logits.view(-1,256), y.view(-1)) + aux_loss
-            else:
-                logits, aux_loss, stats = model(
-                    x, return_aux=True, return_chunks=collect_chunks)
-                loss = crit(logits.view(-1,256), y.view(-1)) + aux_loss
+    ce_sum, aux_sum, n_bytes, n_batches = 0.0, 0.0, 0, 0
+    chunk_len_sum, chunk_lengths = 0.0, []
 
-            tot += loss.item()
-            ntok += y.numel()
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            logits, aux_loss, stats = model(
+                x, return_aux=True, return_chunk_lengths=collect_chunks
+            )
+            ce = nn.functional.cross_entropy(
+                logits.reshape(-1, VOCAB_SIZE), y.reshape(-1), reduction="sum"
+            )
+        ce_sum += ce.item()
+        aux_sum += aux_loss.item()
+        chunk_len_sum += stats["avg_chunk_len"]
+        n_bytes += y.numel()
+        n_batches += 1
 
-            if collect_chunks and isinstance(stats, dict) and "chunk_len_samples" in stats and max_hist > 0:
-                need = max_hist - len(chunk_lens)
-                if need > 0:
-                    sl = stats["chunk_len_samples"]
-                    if len(sl) > need:
-                        sl = sl[:need]
-                    chunk_lens.extend(sl)
+        if collect_chunks and len(chunk_lengths) < max_samples:
+            chunk_lengths.extend(stats["chunk_lengths"].tolist())
 
-    avg = tot/ntok
-    ppl = math.exp(avg)
-    bpb = avg / math.log(2.0)
-    return avg, ppl, bpb, chunk_lens
+    ce = ce_sum / n_bytes
+    return {
+        "ce": ce,
+        "ppl": math.exp(ce),
+        "bpb": ce / math.log(2.0),
+        "aux": aux_sum / n_batches,
+        "avg_chunk_len": chunk_len_sum / n_batches,
+        "chunk_lengths": chunk_lengths[:max_samples],
+    }
 
-def plot_curves(history, outdir, title_prefix=""):
-    os.makedirs(outdir, exist_ok=True)
 
-    # Try SciencePlots style if available
-    try:
-        import scienceplots  # pip install SciencePlots
-        plt.style.use("science")
-    except Exception:
-        pass
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    amp_dtype=None,
+    accum_steps: int = 1,
+    grad_clip: float = 1.0,
+) -> dict:
+    """One pass over the training set. Returns mean CE, aux loss and chunk length."""
+    model.train()
+    ce_sum, aux_sum, n_bytes, n_batches = 0.0, 0.0, 0, 0
+    chunk_len_sum = 0.0
+    optimizer.zero_grad(set_to_none=True)
 
-    ep = list(range(1, len(history.get("val_loss", [])) + 1))
+    for step, (x, y) in enumerate(loader, start=1):
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            logits, aux_loss, stats = model(x, return_aux=True)
+            ce = nn.functional.cross_entropy(logits.reshape(-1, VOCAB_SIZE), y.reshape(-1))
+            loss = ce + aux_loss
 
-    # Loss
-    plt.figure()
-    if "train_loss" in history: plt.plot(ep, history["train_loss"], label="train")
-    if "val_loss"   in history: plt.plot(ep, history["val_loss"],   label="val")
-    plt.xlabel("epoch"); plt.ylabel("avg CE loss (nats/byte)")
-    if title_prefix: plt.title(f"{title_prefix} Loss")
-    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "loss_curves.png"), dpi=160)
+        (loss / accum_steps).backward()
+        if step % accum_steps == 0:
+            if grad_clip:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-    # Perplexity
-    plt.figure()
-    if "val_ppl" in history: plt.plot(ep, history["val_ppl"], label="val ppl")
-    plt.xlabel("epoch"); plt.ylabel("perplexity")
-    if title_prefix: plt.title(f"{title_prefix} Perplexity")
-    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "perplexity.png"), dpi=160)
+        ce_sum += ce.item() * y.numel()
+        aux_sum += aux_loss.item()
+        chunk_len_sum += stats["avg_chunk_len"]
+        n_bytes += y.numel()
+        n_batches += 1
 
-    # (1) Avg chunk length vs epoch
-    if "avg_chunk_len" in history and len(history["avg_chunk_len"]) == len(ep):
-        plt.figure()
-        plt.plot(ep, history["avg_chunk_len"], label="avg chunk length")
-        plt.xlabel("epoch"); plt.ylabel("avg chunk length (bytes)")
-        if title_prefix: plt.title(f"{title_prefix} Avg Chunk Length")
-        plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "avg_chunk_len.png"), dpi=160)
+    return {
+        "ce": ce_sum / n_bytes,
+        "aux": aux_sum / n_batches,
+        "avg_chunk_len": chunk_len_sum / n_batches,
+    }
 
-    # (2) Histogram + ECDF of chunk lengths (VAL)
-    if "chunk_len_samples" in history and len(history["chunk_len_samples"]) > 0:
-        L = np.asarray(history["chunk_len_samples"], dtype=np.int64)
 
-        # Histogram
-        plt.figure()
-        med = int(np.median(L))
-        bins_max = max(32, min(med*2, int(L.max())))
-        bins = min(100, bins_max)
-        plt.hist(L, bins=bins)
-        plt.xlabel("chunk length (bytes)"); plt.ylabel("count")
-        if title_prefix: plt.title(f"{title_prefix} Chunk Length Histogram")
-        plt.grid(True, alpha=0.3); plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "chunk_len_hist.png"), dpi=160)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    data = p.add_argument_group("data")
+    data.add_argument("--train-files", nargs="+", required=True)
+    data.add_argument("--val-files", nargs="+", required=True)
+    data.add_argument("--seq-len", type=int, default=2048)
+    data.add_argument("--train-bytes-cap", type=int, default=0,
+                      help="truncate the training stream to N bytes (0 = all)")
+    data.add_argument("--val-bytes-cap", type=int, default=0)
+    data.add_argument("--num-workers", type=int, default=min(8, os.cpu_count() or 1))
 
-        # ECDF
-        plt.figure()
-        Ls = np.sort(L)
-        y = np.arange(1, len(Ls)+1) / len(Ls)
-        plt.plot(Ls, y)
-        plt.xlabel("chunk length (bytes)"); plt.ylabel("ECDF")
-        if title_prefix: plt.title(f"{title_prefix} Chunk Length ECDF")
-        plt.grid(True, alpha=0.3); plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "chunk_len_ecdf.png"), dpi=160)
+    model = p.add_argument_group("model")
+    model.add_argument("--target-chunk-len", type=int, default=64)
+    model.add_argument("--aux-weight", type=float, default=0.05,
+                       help="weight of the boundary-rate penalty")
+    model.add_argument("--tau", type=float, default=0.6,
+                       help="EMA coefficient on the router logits")
+    model.add_argument("--dropout", type=float, default=0.1)
 
-    # (5) Learning rate vs epoch
-    if "lr" in history and len(history["lr"]) == len(ep):
-        plt.figure()
-        plt.plot(ep, history["lr"])
-        plt.xlabel("epoch"); plt.ylabel("learning rate")
-        if title_prefix: plt.title(f"{title_prefix} Learning Rate")
-        plt.grid(True, alpha=0.3); plt.tight_layout()
-        plt.savefig(os.path.join(outdir, "lr_curve.png"), dpi=160)
+    optim = p.add_argument_group("optimisation")
+    optim.add_argument("--batch-size", type=int, default=24)
+    optim.add_argument("--epochs", type=int, default=8)
+    optim.add_argument("--lr", type=float, default=2e-3)
+    optim.add_argument("--weight-decay", type=float, default=0.01)
+    optim.add_argument("--accum-steps", type=int, default=1)
+    optim.add_argument("--grad-clip", type=float, default=1.0)
+    optim.add_argument("--amp", action="store_true", help="mixed-precision training")
+    optim.add_argument("--patience", type=int, default=0,
+                       help="stop after N epochs without validation improvement (0 = off)")
+    optim.add_argument("--min-delta", type=float, default=0.0)
+    optim.add_argument("--seed", type=int, default=0)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train_files", nargs="+", required=True)
-    ap.add_argument("--val_files",   nargs="+", required=True)
-    ap.add_argument("--seq_len", type=int, default=2048)
-    ap.add_argument("--batch_size", type=int, default=24)
-    ap.add_argument("--epochs", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=2e-3)
-    ap.add_argument("--wd", type=float, default=0.01)
-    ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--target_chunk_len", type=int, default=64)
-    ap.add_argument("--aux_w", type=float, default=0.05)
-    ap.add_argument("--tau", type=float, default=0.6)
-    ap.add_argument("--accum", type=int, default=1)
-    ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--outdir", default="runs/dc_lite")
-    ap.add_argument("--amp", action="store_true")
-    # Early stopping
-    ap.add_argument("--early_stop_patience", type=int, default=0,
-                    help="stop if no val improvement for N epochs (0 disables)")
-    ap.add_argument("--early_stop_min_delta", type=float, default=0.0,
-                    help="minimum decrease in val loss to count as an improvement")
-    # Resume + checkpoints
-    ap.add_argument("--resume", type=str, default=None,
-                    help="path to checkpoint (best.pt/last.pt/epoch_*.pt)")
-    ap.add_argument("--save_every", type=int, default=0,
-                    help="save epoch_{N}.pt every N epochs (0=off)")
-    ap.add_argument("--save_last", action="store_true",
-                    help="save last.pt each epoch")
-    # Fast trials / loader tweaks
-    ap.add_argument("--train_bytes_cap", type=int, default=0,
-                    help="truncate train stream to first N bytes (0=all)")
-    ap.add_argument("--val_bytes_cap", type=int, default=0,
-                    help="truncate val stream to first N bytes (0=all)")
-    ap.add_argument("--num_workers", type=int, default=min(8, os.cpu_count()))
-    # DC plots
-    ap.add_argument("--collect_chunk_hist", action="store_true",
-                    help="collect VAL chunk lengths for histogram/ECDF (requires model support)")
-    ap.add_argument("--max_hist_samples", type=int, default=50000,
-                    help="max chunk-length samples to collect on VAL")
-    # NEW: skip plots for random search
-    ap.add_argument("--no_plots", action="store_true",
-                    help="skip generating/saving plots (useful for fast trials)")
-    args = ap.parse_args()
+    io = p.add_argument_group("io")
+    io.add_argument("--outdir", type=Path, default=Path("runs/dc_lite"))
+    io.add_argument("--resume", type=Path, default=None)
+    io.add_argument("--save-last", action="store_true")
+    io.add_argument("--save-every", type=int, default=0)
+    io.add_argument("--collect-chunk-hist", action="store_true")
+    io.add_argument("--max-hist-samples", type=int, default=50_000)
+    return p.parse_args(argv)
 
-    device = device_auto()
-    print("Device:", device)
 
-    train_ds = ByteSequenceDataset(
-        args.train_files, seq_len=args.seq_len, step=args.seq_len, bytes_cap=args.train_bytes_cap
-    )
-    val_ds = ByteSequenceDataset(
-        args.val_files,   seq_len=args.seq_len, step=args.seq_len, bytes_cap=args.val_bytes_cap
-    )
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    torch.manual_seed(args.seed)
+    device = pick_device()
+    amp_dtype = autocast_dtype_for(device, args.amp)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+    print(f"device={device} amp={amp_dtype}")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=(device.type=="cuda")
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=(device.type=="cuda")
-    )
+    args.outdir.mkdir(parents=True, exist_ok=True)
 
-    model = DCLiteLM(
-        vocab_size=256,
-        d_model_tok=256, d_model_chunk=384,
-        n_layers_tok=2, n_heads_tok=4,
-        n_layers_chunk=4, n_heads_chunk=6,
-        mlp_mult=2.0, dropout=args.dropout,
+    loaders = {}
+    for split, files, cap in (
+        ("train", args.train_files, args.train_bytes_cap),
+        ("val", args.val_files, args.val_bytes_cap),
+    ):
+        ds = ByteSequenceDataset(files, seq_len=args.seq_len, bytes_cap=cap)
+        loaders[split] = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=(split == "train"),
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        print(f"{split}: {len(ds.data):,} bytes, {len(ds):,} windows")
+
+    config = DCLiteConfig(
+        dropout=args.dropout,
         target_chunk_len=args.target_chunk_len,
-        boundary_rate_weight=args.aux_w,
+        boundary_rate_weight=args.aux_weight,
         smooth_tau=args.tau,
-    ).to(device)
+    )
+    model = DCLiteLM(config).to(device)
+    print(f"model: {model.num_parameters():,} parameters")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    try:
-        # fused=True can be faster on A100; ignore if not supported
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd, fused=True)
-    except TypeError:
-        pass
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    crit = nn.CrossEntropyLoss(reduction="mean")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    autocast_dtype = None
-    if args.amp:
-        if device.type=="cuda" and torch.cuda.is_bf16_supported():
-            autocast_dtype = torch.bfloat16
-        else:
-            autocast_dtype = torch.float16
-        if device.type=="cuda":
-            torch.set_float32_matmul_precision("high")
+    history: dict[str, list] = {
+        k: [] for k in
+        ("train_ce", "train_aux", "val_ce", "val_ppl", "val_bpb", "val_aux", "avg_chunk_len", "lr")
+    }
+    best_val = float("inf")
+    start_epoch, stale_epochs = 1, 0
 
-    history={"train_loss":[], "val_loss":[], "val_ppl":[], "val_bpb":[],
-             "lr":[], "avg_chunk_len":[]}
-    best=float("inf")
-    patience_ctr = 0
-    start_epoch = 1
-    os.makedirs(args.outdir, exist_ok=True)
-
-    # --------- RESUME (optional) ----------
-    if args.resume is not None and os.path.exists(args.resume):
+    if args.resume is not None and args.resume.exists():
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model"])
-        if "opt" in ckpt:   opt.load_state_dict(ckpt["opt"])
-        if "sched" in ckpt:
-            try: sched.load_state_dict(ckpt["sched"])
-            except Exception: pass
-        best = ckpt.get("best_val", best)
-        if "history" in ckpt and isinstance(ckpt["history"], dict):
-            for k,v in ckpt["history"].items():
-                history[k] = v
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        history.update(ckpt.get("history", {}))
+        best_val = ckpt.get("best_val", best_val)
         start_epoch = ckpt.get("epoch", 0) + 1
-        print(f"Resumed from {args.resume} at epoch {start_epoch} (best_val={best:.4f})")
-        if "sched" not in ckpt:
-            for _ in range(max(0, start_epoch-1)): sched.step()
-    # --------------------------------------
+        print(f"resumed from {args.resume} at epoch {start_epoch} (best val CE {best_val:.4f})")
 
+    epoch = start_epoch - 1
     try:
-        for ep in range(start_epoch, args.epochs+1):
-            model.train()
-            run, ntok = 0.0, 0
-            opt.zero_grad(set_to_none=True)
-            stats = {"avg_chunk_len": float("nan")}  # last-batch DC stat for logging
-
-            for it,(x,y) in enumerate(train_loader,1):
-                x=x.to(device); y=y.to(device)
-                if autocast_dtype:
-                    with torch.autocast(device.type, dtype=autocast_dtype):
-                        logits, aux_loss, stats = model(x, return_aux=True)
-                        loss = crit(logits.view(-1,256), y.view(-1)) + aux_loss
-                else:
-                    logits, aux_loss, stats = model(x, return_aux=True)
-                    loss = crit(logits.view(-1,256), y.view(-1)) + aux_loss
-
-                (loss/args.accum).backward()
-                if it % args.accum == 0:
-                    if args.grad_clip: nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                    opt.step(); opt.zero_grad(set_to_none=True)
-
-                run += loss.item() * y.numel()
-                ntok += y.numel()
-
-            train_loss = run/ntok
-            val_loss, val_ppl, val_bpb, chunk_lens = evaluate(
-                model, val_loader, device, autocast_dtype,
+        for epoch in range(start_epoch, args.epochs + 1):
+            train = train_one_epoch(
+                model, loaders["train"], optimizer, device, amp_dtype,
+                args.accum_steps, args.grad_clip,
+            )
+            val = evaluate(
+                model, loaders["val"], device, amp_dtype,
                 collect_chunks=args.collect_chunk_hist,
-                max_hist=args.max_hist_samples
+                max_samples=args.max_hist_samples,
+            )
+            lr = optimizer.param_groups[0]["lr"]
+
+            for key, value in (
+                ("train_ce", train["ce"]), ("train_aux", train["aux"]),
+                ("val_ce", val["ce"]), ("val_ppl", val["ppl"]),
+                ("val_bpb", val["bpb"]), ("val_aux", val["aux"]),
+                ("avg_chunk_len", val["avg_chunk_len"]), ("lr", lr),
+            ):
+                history[key].append(value)
+            if args.collect_chunk_hist:
+                history["chunk_lengths"] = val["chunk_lengths"]
+
+            print(
+                f"epoch {epoch:02d} | lr {lr:.3g} | train CE {train['ce']:.4f} | "
+                f"val CE {val['ce']:.4f} | ppl {val['ppl']:.2f} | bpb {val['bpb']:.3f} | "
+                f"chunk len {val['avg_chunk_len']:.1f}"
             )
 
-            history["train_loss"].append(train_loss)
-            history["val_loss"].append(val_loss)
-            history["val_ppl"].append(val_ppl)
-            history["val_bpb"].append(val_bpb)
-            history["lr"].append(float(opt.param_groups[0]["lr"]))
-            history["avg_chunk_len"].append(float(stats.get("avg_chunk_len", float("nan"))))
-
-            if args.collect_chunk_hist and chunk_lens:
-                history["chunk_len_samples"] = history.get("chunk_len_samples", []) + list(chunk_lens)
-
-            print(f"Epoch {ep:02d} | lr {opt.param_groups[0]['lr']:.6g} | "
-                  f"train {train_loss:.4f} | val {val_loss:.4f} | ppl {val_ppl:.2f} | "
-                  f"bpb {val_bpb:.3f} | avg_chunk_len~{history['avg_chunk_len'][-1]:.1f}")
-
-            # ----- checkpoint payload -----
-            ckpt_payload = {
+            checkpoint = {
                 "model": model.state_dict(),
-                "opt": opt.state_dict(),
-                "sched": sched.state_dict(),
-                "epoch": ep,
-                "best_val": best,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_val": best_val,
                 "history": history,
-                "config": vars(args),
+                "args": {k: str(v) for k, v in vars(args).items()},
+                "config": asdict(config),
             }
-
-            # save-best + early stop
-            improved = (best - val_loss) > args.early_stop_min_delta
-            if improved:
-                best = val_loss
-                torch.save(ckpt_payload, os.path.join(args.outdir, "best.pt"))
-                patience_ctr = 0
+            if best_val - val["ce"] > args.min_delta:
+                best_val = val["ce"]
+                checkpoint["best_val"] = best_val
+                torch.save(checkpoint, args.outdir / "best.pt")
+                stale_epochs = 0
             else:
-                patience_ctr += 1
-
-            # optional periodic & last
+                stale_epochs += 1
             if args.save_last:
-                torch.save(ckpt_payload, os.path.join(args.outdir, "last.pt"))
-            if args.save_every and (ep % args.save_every == 0):
-                torch.save(ckpt_payload, os.path.join(args.outdir, f"epoch_{ep}.pt"))
+                torch.save(checkpoint, args.outdir / "last.pt")
+            if args.save_every and epoch % args.save_every == 0:
+                torch.save(checkpoint, args.outdir / f"epoch_{epoch}.pt")
 
-            if args.early_stop_patience and patience_ctr >= args.early_stop_patience:
-                print(f"Early stopping at epoch {ep} (no val improvement for {patience_ctr} epochs).")
+            if args.patience and stale_epochs >= args.patience:
+                print(f"early stop at epoch {epoch}: no improvement for {stale_epochs} epochs")
                 break
-
-            sched.step()
-
+            scheduler.step()
     except KeyboardInterrupt:
-        print("Interrupted — saving last.pt")
-        torch.save({
-            "model": model.state_dict(), "opt": opt.state_dict(),
-            "sched": sched.state_dict(), "epoch": ep, "best_val": best,
-            "history": history, "config": vars(args),
-        }, os.path.join(args.outdir, "last.pt"))
-        raise
+        print(f"interrupted at epoch {epoch}")
 
-    with open(os.path.join(args.outdir,"history.json"),"w") as f:
-        json.dump(history,f,indent=2)
+    with open(args.outdir / "history.json", "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"artifacts written to {args.outdir}")
 
-    # ONLY plot if not disabled
-    if not args.no_plots:
-        plot_curves(history, args.outdir, title_prefix="DC-Lite")
 
-    print("Saved artifacts to:", args.outdir)
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
