@@ -85,7 +85,7 @@ numbers stay comparable across runs with different penalty weights.
 | `utf8_delim` | 1.5155 | 2.859 | 70.0% |
 | `byte_aligned` | 1.7180 | 3.290 | 97.8% |
 
-Main finding: [one sentence].
+Main finding: UTF-8 achieves the lower overall perplexity (2.859 vs 3.290; 1.5155 vs 1.7180 bits per byte), but only over the 70% of messages it decodes reliably, whereas the fixed-width byte-aligned scheme reaches 97.8% coverage with faster, smoother convergence and lower per-field perplexity on the hardest numerical channels: diff_tick_size, size and inter-arrival time, making it the preferable representation end-to-end.
 
 ## Files
 
