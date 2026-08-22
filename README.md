@@ -4,8 +4,8 @@ A byte-level autoregressive model for limit order book message streams that
 learns its own segmentation instead of using a fixed tokenizer or hand-designed
 snapshot features.
 
-MSc Statistical Science dissertation, University of Oxford (Distinction, 2025).
-Supervisors: Mihai Cucuringu, Stefan Zohren — Oxford-Man Institute of Quantitative Finance.
+MSc Statistical Science dissertation, University of Oxford.
+Supervisors: Mihai Cucuringu, Stefan Zohren, Oxford-Man Institute of Quantitative Finance.
 
 **[Read the thesis](Delissen_2025_DC_Lite_LOB.pdf)**
 
