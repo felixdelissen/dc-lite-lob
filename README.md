@@ -17,11 +17,11 @@ BPE and its variants are a poor fit for order book data. They are fitted to char
 
 A simplified H-Net adapted to order book messages:
 
-1. **Serialization** — LOBSTER rows to raw bytes under two schemes (`serialize_lobster.py`), so the effect of field layout on the learned segmentation can be measured.
-2. **Byte encoder** — embedding over a 256-symbol alphabet plus a shallow causal transformer (2 pre-norm blocks, 4 heads, `d=256`), producing one contextual vector per byte.
-3. **Router and dynamic chunking** — an MLP (256→128→1, GELU) emits a boundary logit per position, smoothed by a causal EMA. The logit is thresholded in the forward pass and differentiated with a straight-through estimator, so the segmentation trains jointly with the rest of the network. A boundary-rate penalty pulls the mean chunk length towards a target.
-4. **Chunk transformer** — 4 pre-norm blocks, 6 heads, operating on mean-pooled chunk representatives, so the main backbone runs on a sequence shorter by roughly the mean chunk length.
-5. **Decoder** — chunk states are broadcast back to byte positions, fused with the byte-level states, and passed to a next-byte head over the 256-byte vocabulary.
+1. **Serialization**:  LOBSTER rows to raw bytes under two schemes (`serialize_lobster.py`), so the effect of field layout on the learned segmentation can be measured.
+2. **Byte encoder**: embedding over a 256-symbol alphabet plus a shallow causal transformer (2 pre-norm blocks, 4 heads, `d=256`), producing one contextual vector per byte.
+3. **Router and dynamic chunking**: an MLP (256→128→1, GELU) emits a boundary logit per position, smoothed by a causal EMA. The logit is thresholded in the forward pass and differentiated with a straight-through estimator, so the segmentation trains jointly with the rest of the network. A boundary-rate penalty pulls the mean chunk length towards a target.
+4. **Chunk transformer**: 4 pre-norm blocks, 6 heads, operating on mean-pooled chunk representatives, so the main backbone runs on a sequence shorter by roughly the mean chunk length.
+5. **Decoder**: chunk states are broadcast back to byte positions, fused with the byte-level states, and passed to a next-byte head over the 256-byte vocabulary.
 
 Total: 6.7M parameters, trainable on a single A100.
 
@@ -36,7 +36,7 @@ Fields are ordered from lowest to highest entropy (`side → type → size → d
 
 ## Data
 
-LOBSTER Level-3 message files. **No market data is included in this repository** — LOBSTER data is licensed and must be obtained separately. The serialization script expects the standard LOBSTER message CSV layout: time, event type, order ID, size, price (dollars × 10,000), direction.
+LOBSTER Level-3 message files. **No market data is included in this repository**: LOBSTER data is licensed and must be obtained separately. The serialization script expects the standard LOBSTER message CSV layout: time, event type, order ID, size, price (dollars × 10,000), direction.
 
 Experiments use a single NYSE instrument (Public Storage, PSA) over 252 trading days in 2016, split chronologically: 214 days train, 25 validation, 13 test.
 
@@ -78,7 +78,7 @@ Per-field perplexity at the best checkpoint:
 | `diff_tick_size` | 3.014        | **1.932**      |
 | `iat`            | 9.535        | **7.635**      |
 
-**Main finding.** UTF-8 attains the lower overall perplexity, but only over the 70.8% of messages it decodes reliably — variable-length formatting shifts field boundaries, and a single missing separator corrupts an entire record. The fixed-width byte-aligned scheme reaches 97.7% coverage with faster, smoother convergence and lower per-field perplexity on the three hardest numerical channels, making it the preferable representation end-to-end.
+**Main finding.** UTF-8 attains the lower overall perplexity, but only over the 70.8% of messages it decodes reliably: variable-length formatting shifts field boundaries, and a single missing separator corrupts an entire record. The fixed-width byte-aligned scheme reaches 97.7% coverage with faster, smoother convergence and lower per-field perplexity on the three hardest numerical channels, making it the preferable representation end-to-end.
 
 Both schemes recover the categorical marginals well (`side` within ~1pp, dominant event types correctly ranked) but under-calibrate the upper tails: large order sizes and long inter-arrival gaps are systematically underweighted.
 
@@ -107,4 +107,4 @@ DC-Lite is pretrained on a single NYSE instrument and evaluated on next-byte pre
 
 ## License
 
-MIT — see [LICENSE](https://github.com/felixdelissen/dc-lite-lob/blob/main/LICENSE).
+MIT: see [LICENSE](https://github.com/felixdelissen/dc-lite-lob/blob/main/LICENSE).
