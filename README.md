@@ -34,6 +34,12 @@ Total: 6.7M parameters, trainable on a single A100.
 
 Fields are ordered from lowest to highest entropy (`side → type → size → diff_tick_size → iat`), so that predictable fields provide low-variance context for the harder ones.
 
+![Training and evaluation loss per epoch](figures/loss_epochs.png)
+*Training and evaluation loss remain tightly coupled, best checkpoint at epoch 24.*
+
+![Field-wise perplexity per epoch](figures/field_perplexity_epochs.png)
+*Per-field perplexity ranks as expected: size < side < type ≈ diff_tick_size ≪ iat.*
+
 ## Data
 
 LOBSTER Level-3 message files. **No market data is included in this repository**: LOBSTER data is licensed and must be obtained separately. The serialization script expects the standard LOBSTER message CSV layout: time, event type, order ID, size, price (dollars × 10,000), direction.
