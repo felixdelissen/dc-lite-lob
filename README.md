@@ -5,7 +5,7 @@ learns its own segmentation instead of using a fixed tokenizer or hand-designed
 snapshot features.
 
 MSc Statistical Science dissertation, University of Oxford.
-Supervisors: Mihai Cucuringu, Stefan Zohren, Oxford-Man Institute of Quantitative Finance.
+Supervisors: Mihai Cucuringu, Stefan Zohren, Work conducted at the Department of Statistics, University of Oxford.
 
 **[Read the thesis](Delissen_2025_DC_Lite_LOB.pdf)**
 
